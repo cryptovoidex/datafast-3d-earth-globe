@@ -7,11 +7,17 @@ import * as topojson from "topojson-client";
 import { geoEquirectangular, geoPath } from "d3-geo";
 import { GEO_LABELS, GeoPlaceLabel } from "@/data/geo-labels";
 
+export type GlobeViewMode = "full" | "horizon";
+
 export interface DataFastGlobeProps {
   /** Initial latitude of the globe center (default: 15 - Europe/Africa/Atlantic view like DataFast screenshot) */
   initialLat?: number;
   /** Initial longitude of the globe center (default: -8 - Europe/Africa/Atlantic view) */
   initialLng?: number;
+  /** Initial view mode: 'full' (centered 3D globe) or 'horizon' (tilted bottom-anchored horizon arc) */
+  defaultViewMode?: GlobeViewMode;
+  /** Show the top-right view mode switcher button (default: true) */
+  showViewToggle?: boolean;
   /** Enable gentle auto-rotation when idle (default: false) */
   autoRotate?: boolean;
   /** Auto-rotation speed (default: 0.35) */
@@ -62,6 +68,8 @@ function createStarTexture(): THREE.CanvasTexture {
 export default function DataFastGlobe({
   initialLat = 15,
   initialLng = -8,
+  defaultViewMode = "full",
+  showViewToggle = true,
   autoRotate = false,
   autoRotateSpeed = 0.35,
   className = "",
@@ -69,6 +77,15 @@ export default function DataFastGlobe({
   const mountRef = useRef<HTMLDivElement | null>(null);
   const labelsContainerRef = useRef<HTMLDivElement | null>(null);
   const [isLoaded, setIsLoaded] = useState(false);
+  const [viewMode, setViewMode] = useState<GlobeViewMode>(defaultViewMode);
+  const viewModeRef = useRef<GlobeViewMode>(defaultViewMode);
+
+  // Trigger smooth camera & globe transition when viewMode changes
+  const toggleViewMode = (nextMode?: GlobeViewMode) => {
+    const target = nextMode ?? (viewMode === "full" ? "horizon" : "full");
+    viewModeRef.current = target;
+    setViewMode(target);
+  };
 
   useEffect(() => {
     const container = mountRef.current;
@@ -86,12 +103,45 @@ export default function DataFastGlobe({
 
     const camera = new THREE.PerspectiveCamera(36, width / height, 0.1, 1000);
     const EARTH_RADIUS = 10;
-    // Closer initial distance so the globe fills the viewport vertically just like the DataFast screenshot
-    const INITIAL_DISTANCE = 22.8;
 
-    const initialCamPos = latLngToVector3(initialLat, initialLng, INITIAL_DISTANCE);
+    // Full View vs Horizon View camera & screen framing parameters
+    // Using PerspectiveCamera.setViewOffset shifts the optical center of the lens downward in Horizon mode!
+    // This keeps the globe's 3D rotation 100% natural around its center while placing the top curved
+    // horizon arc at ~33% from the top of the screen and zooming in wide so the bottom fills 90% of the screen width!
+    const FULL_DISTANCE = 22.8;
+    const HORIZON_DISTANCE = 19.6; // Wide dome that leaves starry space above the top horizon arc
+    const FULL_VIEW_OFFSET_Y_FACTOR = 0.0;
+    const HORIZON_VIEW_OFFSET_Y_FACTOR = -0.62; // Shifts the camera window UP so the Earth sits in the BOTTOM half of the screen!
+
+    const isInitialHorizon = viewModeRef.current === "horizon";
+    const startLat = isInitialHorizon ? 36 : initialLat;
+    const startLng = isInitialHorizon ? -88 : initialLng;
+    const startDist = isInitialHorizon ? HORIZON_DISTANCE : FULL_DISTANCE;
+    let currentOffsetYFactor = isInitialHorizon
+      ? HORIZON_VIEW_OFFSET_Y_FACTOR
+      : FULL_VIEW_OFFSET_Y_FACTOR;
+    let targetOffsetYFactor = currentOffsetYFactor;
+    let lastAppliedMode: GlobeViewMode = viewModeRef.current;
+
+    // Camera transition state (smooth spherical slerp + optical lens shift when switching modes)
+    let isTransitioningCamera = false;
+    let transitionProgress = 1;
+    const transitionStartOffset = new THREE.Vector3();
+    const transitionEndOffset = new THREE.Vector3();
+
+    const applyCameraViewOffset = (w: number, h: number, yFactor: number) => {
+      if (Math.abs(yFactor) < 0.0005) {
+        camera.clearViewOffset();
+      } else {
+        camera.setViewOffset(w, h, 0, yFactor * h, w, h);
+      }
+      camera.updateProjectionMatrix();
+    };
+
+    const initialCamPos = latLngToVector3(startLat, startLng, startDist);
     camera.position.copy(initialCamPos);
     camera.lookAt(0, 0, 0);
+    applyCameraViewOffset(width, height, currentOffsetYFactor);
 
     const renderer = new THREE.WebGLRenderer({
       antialias: true,
@@ -100,7 +150,6 @@ export default function DataFastGlobe({
     });
     renderer.setSize(width, height);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    // Important: No toneMapping so exact hex colors (#282b33 land, #13161f ocean) render 1:1 without darkening
     renderer.toneMapping = THREE.NoToneMapping;
 
     container.innerHTML = "";
@@ -108,12 +157,13 @@ export default function DataFastGlobe({
 
     // 2. ORBIT CONTROLS
     const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 0, 0);
     controls.enablePan = false;
     controls.enableDamping = true;
     controls.dampingFactor = 0.06;
-    controls.rotateSpeed = 0.55;
+    controls.rotateSpeed = 0.52;
     controls.zoomSpeed = 0.75;
-    controls.minDistance = 13.5;
+    controls.minDistance = 12.6;
     controls.maxDistance = 40;
     controls.autoRotate = autoRotate;
     controls.autoRotateSpeed = autoRotateSpeed;
@@ -168,15 +218,12 @@ export default function DataFastGlobe({
     scene.add(smallStars);
     scene.add(brightStars);
 
-    // 5. LAYER 2: THICK, SOFT DIFFUSED ATMOSPHERE HALO (Billboard Shader Plane behind the Earth)
-    // Instead of a small sphere with a sharp geometric edge, a camera-facing billboard plane
-    // computes exact radial distance from the Earth's horizon in world units, giving a super thick,
-    // silky-smooth Gaussian atmospheric glow that fades seamlessly into deep space like Mapbox setFog!
-    const HALO_PLANE_SIZE = EARTH_RADIUS * 5.2;
+    // 5. LAYER 2: THICK, SOFT DIFFUSED ATMOSPHERE HALO (Perspective-corrected Billboard behind the Earth)
+    const HALO_PLANE_SIZE = EARTH_RADIUS * 5.6;
     const haloGeo = new THREE.PlaneGeometry(HALO_PLANE_SIZE, HALO_PLANE_SIZE);
     const haloMat = new THREE.ShaderMaterial({
       uniforms: {
-        uEarthRadius: { value: EARTH_RADIUS },
+        uVisualRadius: { value: EARTH_RADIUS },
       },
       vertexShader: `
         varying vec2 vLocalPos;
@@ -186,14 +233,14 @@ export default function DataFastGlobe({
         }
       `,
       fragmentShader: `
-        uniform float uEarthRadius;
+        uniform float uVisualRadius;
         varying vec2 vLocalPos;
 
         void main() {
-          // Normalized distance from globe center: 1.0 = exact horizon edge of Earth
-          float r = length(vLocalPos) / uEarthRadius;
+          // Normalized distance from apparent horizon edge of Earth (1.0 = exact visible limb at any zoom distance!)
+          float r = length(vLocalPos) / uVisualRadius;
 
-          // Distance outside the Earth's limb
+          // Distance outside the Earth's visible limb
           float distFromLimb = max(0.0, r - 0.985);
 
           // 1) Bright, concentrated royal-blue inner horizon glow right along the Earth's edge
@@ -208,9 +255,9 @@ export default function DataFastGlobe({
           float totalAlpha = (innerRim + outerScatter) * edgeFade;
 
           // Color gradient: vibrant royal blue right at the horizon -> deep space navy further out
-          vec3 innerBlue = vec3(0.18, 0.42, 0.88); // #2e6be0
-          vec3 midBlue   = vec3(0.09, 0.23, 0.56); // #173b8f
-          vec3 deepBlue  = vec3(0.03, 0.08, 0.22); // #081438
+          vec3 innerBlue = vec3(0.18, 0.42, 0.88);
+          vec3 midBlue   = vec3(0.09, 0.23, 0.56);
+          vec3 deepBlue  = vec3(0.03, 0.08, 0.22);
 
           float t = clamp(distFromLimb / 0.85, 0.0, 1.0);
           vec3 col = mix(innerBlue, midBlue, smoothstep(0.0, 0.45, t));
@@ -229,7 +276,6 @@ export default function DataFastGlobe({
     scene.add(atmosphereBillboard);
 
     // 6. LAYER 3: DARK MATTE EARTH SPHERE WITH EXACT DATAFAST COLORS
-    // Placeholder texture until 8K canvas finishes
     const placeholderCanvas = document.createElement("canvas");
     placeholderCanvas.width = 64;
     placeholderCanvas.height = 32;
@@ -268,12 +314,11 @@ export default function DataFastGlobe({
           // Facing ratio: 1.0 at center facing camera, 0.0 at horizon edge
           float facing = max(0.0, dot(vViewNormal, vViewDir));
 
-          // Keep countries (#282b33) and borders (#4a4e58) clearly visible across the whole globe!
-          // Center is slightly brighter (1.08), and edges stay well-lit (0.78) so countries never look pitch black
+          // Keep countries (#282b33) and borders (#4a4e58) clearly visible across the whole globe
           float shade = mix(0.76, 1.06, pow(facing, 0.45));
           vec3 baseColor = texColor.rgb * shade;
 
-          // Soft atmospheric blue inner rim on the globe's horizon so the Earth blends seamlessly into the outer halo
+          // Soft atmospheric blue inner rim on the globe's horizon
           float rim = pow(1.0 - facing, 3.2);
           vec3 rimColor = vec3(0.15, 0.36, 0.82) * rim * 0.42;
 
@@ -285,7 +330,7 @@ export default function DataFastGlobe({
     const earthMesh = new THREE.Mesh(earthGeo, earthMat);
     globeGroup.add(earthMesh);
 
-    // 7. LOAD TOPOJSON & RENDER HIGH-RES EQUIRRECTANGULAR MAP (Exact DataFast Country & Border Colors)
+    // 7. LOAD TOPOJSON & RENDER HIGH-RES EQUIRRECTANGULAR MAP
     fetch("/countries-50m.json")
       .then((res) => res.json())
       .then((topology) => {
@@ -303,7 +348,7 @@ export default function DataFastGlobe({
         mapCanvas.height = H;
         const ctx = mapCanvas.getContext("2d")!;
 
-        // 1) Deep dark navy-slate ocean background matching DataFast screenshot (#13161f)
+        // 1) Deep dark navy-slate ocean background (#13161f)
         ctx.fillStyle = "#13161f";
         ctx.fillRect(0, 0, W, H);
 
@@ -313,13 +358,13 @@ export default function DataFastGlobe({
 
         const pathGenerator = geoPath(projection, ctx);
 
-        // 2) Distinct dark charcoal-grey landmass fill (#282b33) so continents stand out clearly from oceans
+        // 2) Distinct dark charcoal-grey landmass fill (#282b33)
         ctx.beginPath();
         pathGenerator(countriesGeo);
         ctx.fillStyle = "#282b33";
         ctx.fill();
 
-        // 3) Crisp country borders (#494e59) matching Algeria, Mali, Libya, etc. in screenshot
+        // 3) Crisp country borders (#494e59)
         ctx.lineWidth = 2.4;
         ctx.strokeStyle = "#494e59";
         ctx.lineJoin = "round";
@@ -327,7 +372,6 @@ export default function DataFastGlobe({
         ctx.stroke();
 
         const highResTexture = new THREE.CanvasTexture(mapCanvas);
-        // Keep linear color space so exact hex values are preserved in our custom ShaderMaterial
         highResTexture.anisotropy = renderer.capabilities.getMaxAnisotropy();
         highResTexture.minFilter = THREE.LinearMipmapLinearFilter;
         highResTexture.magFilter = THREE.LinearFilter;
@@ -346,7 +390,7 @@ export default function DataFastGlobe({
     interface LabelEntry {
       data: GeoPlaceLabel;
       el: HTMLDivElement;
-      worldPos: THREE.Vector3;
+      localPos: THREE.Vector3;
       normal: THREE.Vector3;
       priority: number;
       approxW: number;
@@ -386,7 +430,6 @@ export default function DataFastGlobe({
         el.style.textShadow =
           "-1px -1px 0 #141720, 1px -1px 0 #141720, -1px 1px 0 #141720, 1px 1px 0 #141720, 0 2px 4px rgba(0,0,0,0.9)";
       } else {
-        // Country label
         priority = item.size === "lg" ? 5 : item.size === "md" ? 3 : 1;
         el.style.fontFamily = "var(--font-geist-sans), Inter, system-ui, sans-serif";
         el.style.fontWeight = "600";
@@ -406,13 +449,13 @@ export default function DataFastGlobe({
       const approxW = maxChars * 6.5 + 10;
       const approxH = lines.length * 14 + 6;
 
-      const worldPos = latLngToVector3(item.lat, item.lng, EARTH_RADIUS * 1.003);
-      const normal = worldPos.clone().normalize();
+      const localPos = latLngToVector3(item.lat, item.lng, EARTH_RADIUS * 1.003);
+      const normal = localPos.clone().normalize();
 
       return {
         data: item,
         el,
-        worldPos,
+        localPos,
         normal,
         priority,
         approxW,
@@ -420,44 +463,132 @@ export default function DataFastGlobe({
       };
     });
 
-    // Sort labels by priority descending so major countries/oceans win screen space over dense small countries
     labelEntries.sort((a, b) => b.priority - a.priority);
 
-    // 9. ANIMATION, BILLBOARD ORIENTATION & COLLISION-FREE LABEL PROJECTION LOOP
+    // Stop camera zoom/tilt transition if user manually grabs the globe
+    const onUserInteractStart = () => {
+      isTransitioningCamera = false;
+    };
+    controls.addEventListener("start", onUserInteractStart);
+
+    // 9. ANIMATION, SMOOTH VIEW TRANSITION & COLLISION-FREE LABEL PROJECTION LOOP
     const tempProjVec = new THREE.Vector3();
     const cameraDir = new THREE.Vector3();
     const placedBoxes: { x1: number; y1: number; x2: number; y2: number }[] = [];
+
+    const easeInOutCubic = (t: number) =>
+      t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
 
     const animate = () => {
       if (isDisposed) return;
       animationFrameId = requestAnimationFrame(animate);
 
+      const currentWidth = container.clientWidth || window.innerWidth;
+      const currentHeight = container.clientHeight || window.innerHeight;
+
+      // Detect if user toggled between 'full' and 'horizon' view mode
+      if (viewModeRef.current !== lastAppliedMode) {
+        lastAppliedMode = viewModeRef.current;
+        const toHorizon = lastAppliedMode === "horizon";
+
+        targetOffsetYFactor = toHorizon
+          ? HORIZON_VIEW_OFFSET_Y_FACTOR
+          : FULL_VIEW_OFFSET_Y_FACTOR;
+
+        transitionStartOffset.copy(camera.position);
+
+        // Compute target camera position:
+        // In Horizon mode, zoom in close (HORIZON_DISTANCE = 14.35) so the Earth's dome fills 90% of the screen width,
+        // and tilt toward the northern hemisphere (~36 deg latitude) so United States, Canada, Houston, Toronto, New York, Calgary
+        // sit right along the curved top horizon crest like the DataFast screenshot!
+        const currentSpherical = new THREE.Spherical().setFromVector3(transitionStartOffset);
+        const targetRadius = toHorizon ? HORIZON_DISTANCE : FULL_DISTANCE;
+
+        // Polar angle phi: 0 = North Pole, PI/2 = Equator
+        // 36 deg latitude corresponds to phi = (90 - 36) * PI/180 = 0.94 rad
+        const targetPhi = toHorizon
+          ? Math.max(0.65, Math.min(1.02, currentSpherical.phi - 0.28))
+          : Math.max(0.85, Math.min(1.36, currentSpherical.phi + 0.28));
+
+        const targetSpherical = new THREE.Spherical(
+          targetRadius,
+          targetPhi,
+          currentSpherical.theta
+        );
+        transitionEndOffset.setFromSpherical(targetSpherical);
+
+        transitionProgress = 0;
+        isTransitioningCamera = true;
+      }
+
+      // Smoothly interpolate camera spherical coordinates & lens vertical offset
+      if (isTransitioningCamera) {
+        transitionProgress = Math.min(1, transitionProgress + 0.02);
+        const eased = easeInOutCubic(transitionProgress);
+
+        const startSph = new THREE.Spherical().setFromVector3(transitionStartOffset);
+        const endSph = new THREE.Spherical().setFromVector3(transitionEndOffset);
+
+        const lerpedRadius = THREE.MathUtils.lerp(startSph.radius, endSph.radius, eased);
+        const lerpedPhi = THREE.MathUtils.lerp(startSph.phi, endSph.phi, eased);
+        const lerpedTheta = THREE.MathUtils.lerp(startSph.theta, endSph.theta, eased);
+
+        camera.position.setFromSphericalCoords(lerpedRadius, lerpedPhi, lerpedTheta);
+
+        if (transitionProgress >= 1) {
+          isTransitioningCamera = false;
+        }
+      }
+
+      // Smoothly damp the vertical view offset even if the user interacts mid-transition
+      if (Math.abs(currentOffsetYFactor - targetOffsetYFactor) > 0.0004) {
+        currentOffsetYFactor = THREE.MathUtils.lerp(
+          currentOffsetYFactor,
+          targetOffsetYFactor,
+          0.085
+        );
+        applyCameraViewOffset(currentWidth, currentHeight, currentOffsetYFactor);
+      }
+
       controls.update();
 
-      // Always keep the thick atmosphere glow plane facing the camera right behind the Earth center
+      // Calculate exact perspective tangent horizon radius at the billboard plane (depth = camDist)
+      // For a sphere of radius R viewed from distance D, the tangent cone projects to radius:
+      // R_visual = (R * D) / sqrt(D^2 - R^2)
+      // This ensures the blue atmosphere glow hugs the exact visible horizon edge whether zoomed far out or super close in Horizon mode!
+      const camDist = camera.position.length();
+      const safeDist = Math.max(camDist, EARTH_RADIUS * 1.05);
+      const visualHorizonRadius =
+        (EARTH_RADIUS * safeDist) /
+        Math.sqrt(safeDist * safeDist - EARTH_RADIUS * EARTH_RADIUS);
+      haloMat.uniforms.uVisualRadius.value = visualHorizonRadius;
+
+      // Keep the atmosphere glow plane facing the camera
       atmosphereBillboard.quaternion.copy(camera.quaternion);
 
-      const currentWidth = container.clientWidth;
-      const currentHeight = container.clientHeight;
       const halfW = currentWidth / 2;
       const halfH = currentHeight / 2;
 
-      const camDist = camera.position.length();
       cameraDir.copy(camera.position).normalize();
       placedBoxes.length = 0;
+
+      // Exact geometric horizon dot product: cos(theta_horizon) = R / D
+      // Any surface point with dot(normal, cameraDir) > R / D is geometrically visible in front of the horizon!
+      const geometricHorizonDot = EARTH_RADIUS / safeDist;
 
       for (let i = 0; i < labelEntries.length; i++) {
         const entry = labelEntries[i];
 
-        // 1.0 = facing camera dead center, 0.0 = horizon limb
         const facingDot = entry.normal.dot(cameraDir);
 
-        // Cut off labels near the curved horizon edge so they don't bunch up on the rim
-        let minDotThreshold = 0.26;
+        // Allow labels right up to the curved horizon crest (like Houston, United States, Calgary in Horizon mode!)
+        let minDotThreshold = geometricHorizonDot + 0.035;
         if (entry.data.type === "city") {
-          minDotThreshold = camDist > 28 ? 0.45 : 0.28;
+          minDotThreshold =
+            camDist > 26 ? geometricHorizonDot + 0.16 : geometricHorizonDot + 0.04;
         } else if (entry.data.type === "country" && entry.data.size === "sm") {
-          minDotThreshold = camDist > 29 ? 0.48 : 0.3;
+          minDotThreshold =
+            camDist > 27 ? geometricHorizonDot + 0.18 : geometricHorizonDot + 0.05;
         }
 
         if (facingDot <= minDotThreshold) {
@@ -465,11 +596,22 @@ export default function DataFastGlobe({
           continue;
         }
 
-        tempProjVec.copy(entry.worldPos).project(camera);
+        tempProjVec.copy(entry.localPos).project(camera);
         const screenX = tempProjVec.x * halfW + halfW;
         const screenY = -tempProjVec.y * halfH + halfH;
 
-        // Screen-space bounding box collision check so European countries never overlap each other
+        // Cull labels outside viewport bounds
+        if (
+          screenX < -60 ||
+          screenX > currentWidth + 60 ||
+          screenY < -40 ||
+          screenY > currentHeight + 40
+        ) {
+          entry.el.style.opacity = "0";
+          continue;
+        }
+
+        // Screen-space bounding box collision check
         const halfBoxW = entry.approxW * 0.5;
         const halfBoxH = entry.approxH * 0.5;
         const box = {
@@ -496,7 +638,7 @@ export default function DataFastGlobe({
         placedBoxes.push(box);
 
         // Smooth fade-in near the globe's curved horizon
-        const fadeRange = 0.2;
+        const fadeRange = 0.14;
         const alpha = Math.min(1, (facingDot - minDotThreshold) / fadeRange);
 
         entry.el.style.opacity = alpha.toFixed(2);
@@ -514,7 +656,7 @@ export default function DataFastGlobe({
       const newW = container.clientWidth || window.innerWidth;
       const newH = container.clientHeight || window.innerHeight;
       camera.aspect = newW / newH;
-      camera.updateProjectionMatrix();
+      applyCameraViewOffset(newW, newH, currentOffsetYFactor);
       renderer.setSize(newW, newH);
     };
 
@@ -524,6 +666,7 @@ export default function DataFastGlobe({
       isDisposed = true;
       cancelAnimationFrame(animationFrameId);
       window.removeEventListener("resize", handleResize);
+      controls.removeEventListener("start", onUserInteractStart);
       controls.dispose();
       renderer.dispose();
       earthGeo.dispose();
@@ -538,9 +681,12 @@ export default function DataFastGlobe({
     <div
       className={`relative w-full h-full overflow-hidden select-none ${className}`}
       style={{
-        // Deep space universe gradient matching DataFast's outer space color (#060b19 -> #02040a)
+        // Dynamically shift the radial space glow downward in Horizon mode so the blue space backdrop tracks the horizon dome
         background:
-          "radial-gradient(circle at 50% 50%, #0d1d47 0%, #07112b 48%, #040817 78%, #02040a 100%)",
+          viewMode === "horizon"
+            ? "radial-gradient(circle at 50% 88%, #0d1d47 0%, #07112b 54%, #040817 82%, #02040a 100%)"
+            : "radial-gradient(circle at 50% 50%, #0d1d47 0%, #07112b 48%, #040817 78%, #02040a 100%)",
+        transition: "background 0.9s cubic-bezier(0.22, 1, 0.36, 1)",
       }}
     >
       {/* WebGL 3D Canvas Mount */}
@@ -554,6 +700,65 @@ export default function DataFastGlobe({
         ref={labelsContainerRef}
         className="absolute inset-0 w-full h-full pointer-events-none overflow-hidden"
       />
+
+      {/* Top-Right View Switcher (Full Globe vs Horizon View) */}
+      {showViewToggle && (
+        <div className="absolute top-5 right-5 z-20 flex items-center gap-1 p-1 rounded-xl bg-[#141720]/85 border border-white/10 backdrop-blur-md shadow-2xl">
+          <button
+            type="button"
+            onClick={() => toggleViewMode("full")}
+            title="Full Globe View"
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-all duration-300 cursor-pointer ${
+              viewMode === "full"
+                ? "bg-blue-500/20 text-blue-300 border border-blue-400/30 shadow-sm"
+                : "text-zinc-400 hover:text-zinc-200 border border-transparent"
+            }`}
+          >
+            {/* Full 3D Globe Icon */}
+            <svg
+              className="w-3.5 h-3.5"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <circle cx="12" cy="12" r="10" />
+              <path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20" />
+              <path d="M2 12h20" />
+            </svg>
+            <span>Globe</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => toggleViewMode("horizon")}
+            title="Horizon Arc View"
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-all duration-300 cursor-pointer ${
+              viewMode === "horizon"
+                ? "bg-blue-500/20 text-blue-300 border border-blue-400/30 shadow-sm"
+                : "text-zinc-400 hover:text-zinc-200 border border-transparent"
+            }`}
+          >
+            {/* Horizon Arc / Half-Moon Globe Icon matching DataFast */}
+            <svg
+              className="w-3.5 h-3.5"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M2 18a10 10 0 0 1 20 0" />
+              <path d="M6 18a6 10 0 0 1 12 0" />
+              <line x1="2" y1="18" x2="22" y2="18" />
+            </svg>
+            <span>Horizon</span>
+          </button>
+        </div>
+      )}
 
       {/* Subtle loading transition */}
       {!isLoaded && (
